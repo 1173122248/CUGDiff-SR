@@ -265,6 +265,8 @@ class UPSRRealModel(SRModel):
             # 训练策略标志
             self.joint_training = train_opt.get('joint_u2m_training', True)
             self.freeze_main_network = train_opt.get('freeze_main_network', False)
+            # 消融实验：是否使用主干损失来训练U²M（而非U2MLoss）
+            self.u2m_use_backbone_loss = train_opt.get('u2m_use_backbone_loss', False)
             
             # 初始化U²M网络
             u2m_opt = self.opt.get('network_u2m', {})
@@ -324,6 +326,8 @@ class UPSRRealModel(SRModel):
             
             if not self.joint_training:
                 logger.info("U2M will be trained separately (no main network updates)")
+            if self.u2m_use_backbone_loss:
+                logger.info("[ABLATION] U2M will use backbone loss (L1+LPIPS) instead of U2MLoss")
             if self.freeze_main_network:
                 logger.info("Freezing main network (only U2M trainable)")
                 for param in self.net_g.parameters():
@@ -477,7 +481,17 @@ class UPSRRealModel(SRModel):
             )
             self.optimizers.append(self.optimizer_uncertainty)
 
-    def backward_step(self, dif_loss_wrapper, micro_lq, micro_gt, num_grad_accumulate, tt):
+    def backward_step(
+        self,
+        dif_loss_wrapper,
+        micro_lq,
+        micro_gt,
+        num_grad_accumulate,
+        tt,
+        dynamic_loss_wrapper=None,
+        lambda_dyn=0.1,
+        lambda_final=0.2,
+    ):
         loss_dict = OrderedDict()
 
         context = amp.autocast if self.opt['train'].get('use_fp16', False) else nullcontext
@@ -488,6 +502,22 @@ class UPSRRealModel(SRModel):
             
             l_total = l_pix
             loss_dict['l_pix'] = l_pix 
+
+            if dynamic_loss_wrapper is not None:
+                dyn_losses = dynamic_loss_wrapper()
+                loss_dyn_total = torch.nan_to_num(dyn_losses['loss_dyn_total'], nan=0.0, posinf=1e3, neginf=0.0)
+                loss_final = torch.nan_to_num(dyn_losses['loss_final'], nan=0.0, posinf=1e3, neginf=0.0)
+
+                l_dyn = lambda_dyn * loss_dyn_total / num_grad_accumulate
+                l_final = lambda_final * loss_final / num_grad_accumulate
+
+                l_total += l_dyn + l_final
+                loss_dict['l_dyn'] = l_dyn
+                loss_dict['l_final'] = l_final
+                loss_dict['rollout_pred_delta'] = dyn_losses.get(
+                    'pred_delta_mean',
+                    torch.zeros_like(l_dyn),
+                )
 
             if self.cri_perceptual:
                 # 计算per-sample LPIPS
@@ -522,6 +552,25 @@ class UPSRRealModel(SRModel):
         micro_batchsize = self.opt['datasets']['train']['micro_batchsize']
         num_grad_accumulate = math.ceil(current_batchsize / micro_batchsize)
 
+        train_opt = self.opt.get('train', {})
+        rollout_use_flag = train_opt.get('use_dynamic_rollout_train', False)
+        rollout_start_iter = train_opt.get('rollout_start_iter', 10000)
+        rollout_steps = train_opt.get('rollout_steps', 2)
+        rollout_ddim_eta = train_opt.get('rollout_ddim_eta', 0.0)
+        rollout_mix_alpha = train_opt.get('rollout_mix_alpha', 0.1)
+        rollout_dynamic_update_un = train_opt.get('rollout_dynamic_update_un', False)
+        lambda_dyn = train_opt.get('lambda_dyn', 0.1)
+        lambda_final = train_opt.get('lambda_final', 0.2)
+        freeze_u2m_in_rollout = train_opt.get('freeze_u2m_in_rollout', True)
+
+        rollout_enabled = (
+            rollout_use_flag
+            and current_iter >= rollout_start_iter
+            and self.use_u2m
+            and hasattr(self, 'net_u2m')
+            and self.net_u2m is not None
+        )
+
         # 只有在主网络未冻结时才清零梯度
         if self.optimizer_g is not None:
             self.optimizer_g.zero_grad()
@@ -530,6 +579,10 @@ class UPSRRealModel(SRModel):
         loss_dict['l_pix'] = 0
         if self.cri_perceptual:
             loss_dict['l_lpips'] = 0
+        if rollout_enabled:
+            loss_dict['l_dyn'] = 0
+            loss_dict['l_final'] = 0
+            loss_dict['rollout_pred_delta'] = 0
 
         for jj in range(0, current_batchsize, micro_batchsize):
             micro_lq = self.lq[jj:jj+micro_batchsize,]
@@ -568,10 +621,15 @@ class UPSRRealModel(SRModel):
                 )
                 u2m_input_fwd = torch.cat([micro_lq_up, micro_sr_mse], dim=1)  # (B, 6, H, W)
                 
-                # 关键修正: 主干训练阶段,U²M只提供不确定性指导,不接收梯度
-                # U²M的梯度更新仅在_train_u2m阶段进行(包括联合训练的主干回传)
-                with torch.no_grad():
+                # 消融模式：使用主干损失训练U²M时，需要让U²M接收梯度
+                if getattr(self, 'u2m_use_backbone_loss', False):
+                    # U²M通过主干损失(L1+LPIPS)接收梯度
                     sigma_fwd, global_v_fwd = self.net_u2m(u2m_input_fwd)  # (B, 1, H, W), (B, 1, 1, 1)
+                else:
+                    # 正常模式: 主干训练阶段,U²M只提供不确定性指导,不接收梯度
+                    # U²M的梯度更新仅在_train_u2m阶段进行(包括联合训练的主干回传)
+                    with torch.no_grad():
+                        sigma_fwd, global_v_fwd = self.net_u2m(u2m_input_fwd)  # (B, 1, H, W), (B, 1, 1, 1)
                 # 扩展到3通道以匹配扩散过程
                 micro_uncertainty = sigma_fwd.expand_as(micro_sr_mse)
             elif self.use_uncertainty_net:
@@ -615,20 +673,77 @@ class UPSRRealModel(SRModel):
                 noise=noise,
             )
 
+            compute_dynamic_losses = None
+            if rollout_enabled:
+                rollout_kwargs = dict(model_kwargs) if model_kwargs is not None else {}
+                rollout_kwargs.update({
+                    'y0': micro_lq,
+                    'sf': self.sf,
+                    'u2m_noise_scale': self.opt.get('diffusion', {}).get('u2m_noise_scale', 0.3),
+                    'use_time_bias': self.opt.get('diffusion', {}).get('use_time_bias', False),
+                })
+                compute_dynamic_losses = functools.partial(
+                    self.base_diffusion.training_dynamic_losses,
+                    self.net_g,
+                    self.net_u2m,
+                    micro_gt,
+                    micro_lq_bicubic,
+                    micro_sr_mse,
+                    micro_uncertainty,
+                    tt,
+                    model_kwargs=rollout_kwargs,
+                    rollout_steps=rollout_steps,
+                    mix_alpha=rollout_mix_alpha,
+                    ddim_eta=rollout_ddim_eta,
+                    dynamic_update_un=rollout_dynamic_update_un,
+                    freeze_u2m=freeze_u2m_in_rollout,
+                )
+
             if last_batch or self.opt['num_gpu'] <= 1:
-                losses, x_t, x0_pred = self.backward_step(compute_losses, micro_lq, micro_gt, num_grad_accumulate, tt)
+                losses, x_t, x0_pred = self.backward_step(
+                    compute_losses,
+                    micro_lq,
+                    micro_gt,
+                    num_grad_accumulate,
+                    tt,
+                    dynamic_loss_wrapper=compute_dynamic_losses,
+                    lambda_dyn=lambda_dyn,
+                    lambda_final=lambda_final,
+                )
             else:
                 # no_sync() 只在 DistributedDataParallel 中可用
                 if self.opt.get('dist', False):
                     with self.net_g.no_sync():
-                        losses, x_t, x0_pred = self.backward_step(compute_losses, micro_lq, micro_gt, num_grad_accumulate, tt)
+                        losses, x_t, x0_pred = self.backward_step(
+                            compute_losses,
+                            micro_lq,
+                            micro_gt,
+                            num_grad_accumulate,
+                            tt,
+                            dynamic_loss_wrapper=compute_dynamic_losses,
+                            lambda_dyn=lambda_dyn,
+                            lambda_final=lambda_final,
+                        )
                 else:
                     # DataParallel 不需要 no_sync
-                    losses, x_t, x0_pred = self.backward_step(compute_losses, micro_lq, micro_gt, num_grad_accumulate, tt)
+                    losses, x_t, x0_pred = self.backward_step(
+                        compute_losses,
+                        micro_lq,
+                        micro_gt,
+                        num_grad_accumulate,
+                        tt,
+                        dynamic_loss_wrapper=compute_dynamic_losses,
+                        lambda_dyn=lambda_dyn,
+                        lambda_final=lambda_final,
+                    )
             
             loss_dict['l_pix'] += losses['l_pix']
             if self.cri_perceptual:
                 loss_dict['l_lpips'] += losses['l_lpips']
+            if rollout_enabled:
+                loss_dict['l_dyn'] += losses.get('l_dyn', 0)
+                loss_dict['l_final'] += losses.get('l_final', 0)
+                loss_dict['rollout_pred_delta'] += losses.get('rollout_pred_delta', 0)
         
         # === 更新主网络 ===
         if not self.freeze_main_network:
@@ -659,7 +774,25 @@ class UPSRRealModel(SRModel):
         1. U²M损失反向传播到主干网络,引导主干产生与不确定性一致的输出
         2. U²M同时优化自身预测能力和主干重建质量
         3. 两个模块通过共享梯度相互促进,避免脱节
+        
+        消融模式 (u2m_use_backbone_loss=True):
+        - U²M网络通过主干损失(L1+LPIPS)接收梯度,在optimize_parameters阶段已完成更新
+        - 此函数跳过U2MLoss计算,仅记录日志
         """
+        # 消融模式: 使用主干损失训练U²M时,跳过U2MLoss计算
+        # 因为U²M已经在主干训练阶段通过L1+LPIPS损失接收了梯度
+        if getattr(self, 'u2m_use_backbone_loss', False):
+            if current_iter == 1:
+                logger = get_root_logger()
+                logger.info("[ABLATION] U2M is trained via backbone loss (L1+LPIPS), skipping U2MLoss")
+            # 记录零损失用于日志监控
+            loss_dict['l_u2m'] = torch.tensor(0.0)
+            loss_dict['l_u2m_res_align'] = torch.tensor(0.0)
+            loss_dict['l_u2m_calib'] = torch.tensor(0.0)
+            loss_dict['l_u2m_smooth'] = torch.tensor(0.0)
+            loss_dict['l_u2m_mag'] = torch.tensor(0.0)
+            return
+        
         # 联合训练配置
         joint_training = self.opt['train'].get('joint_u2m_training', True)
         u2m_to_backbone_weight = self.opt['train'].get('u2m_to_backbone_weight', 0.1)
@@ -1085,6 +1218,11 @@ class UPSRRealModel(SRModel):
             model_kwargs['sf'] = self.sf
             model_kwargs['u2m_noise_scale'] = self.opt['diffusion'].get('u2m_noise_scale', 0.1)
             model_kwargs['u2m_apply_interval'] = self.opt['diffusion'].get('u2m_apply_interval', 1)
+            model_kwargs['u2m_start_ratio'] = self.opt['diffusion'].get('u2m_start_ratio', 0.3)
+            model_kwargs['u2m_mix_alpha'] = self.opt['diffusion'].get('u2m_mix_alpha', 0.1)
+            model_kwargs['u2m_mix_with_global_v'] = self.opt['diffusion'].get('u2m_mix_with_global_v', True)
+            model_kwargs['dynamic_update_un'] = self.opt['diffusion'].get('dynamic_update_un', False)
+            model_kwargs['use_time_bias'] = self.opt['diffusion'].get('use_time_bias', True)
             # 传递衰减调度器（如果有）
             if hasattr(self, 'decay_scheduler') and self.decay_scheduler is not None:
                 self.decay_scheduler.eval()  # 推理时设为eval模式
@@ -1431,48 +1569,69 @@ class UPSRRealModel(SRModel):
                 # 将不确定性图转换为可视化热力图
                 uncertainty_imgs = []
                 
-                # 🔧 使用固定范围归一化 (避免自适应归一化的误导)
-                # 对于U²M: 期望σ在 [sigma_min, sigma_max] 范围
-                # 对于旧网络: 使用 [min_noise, max_noise] 范围
-                if self.use_u2m:
-                    # 从配置读取sigma范围(推理时使用train配置或默认值)
-                    train_opt = self.opt.get('train', {})
-                    sigma_min = train_opt.get('u2m_loss_opt', {}).get('sigma_min', 0.01)
-                    sigma_max = train_opt.get('u2m_loss_opt', {}).get('sigma_max', 0.45)
-                    # 扩展上限以显示过大的σ
-                    vis_min, vis_max = sigma_min, sigma_max * 2.0
-                else:
-                    # 旧网络使用扩散配置的范围
-                    vis_min = self.opt['diffusion'].get('min_noise', 0.4)
-                    vis_max = 1.0
+                # 🔧 使用百分位数归一化 (确保完整色彩分布)
+                # 策略: 使用1%-99%百分位数作为范围,确保极值不被裁剪
                 
+                # 先收集所有不确定性图的统计信息
+                all_un_maps = []
                 for ii in range(self.uncertainty.shape[0]):
-                    # uncertainty: [B, 1, H, W]
                     un_map = self.uncertainty[ii, 0].detach().cpu().numpy()  # [H, W]
-                    
-                    # 固定范围归一化 (不再自适应)
-                    # σ < vis_min → 蓝色 (0.0)
-                    # σ ≈ (vis_min + vis_max)/2 → 绿色 (0.5)
-                    # σ > vis_max → 红色 (1.0)
+                    all_un_maps.append(un_map)
+                
+                # 计算全局统计
+                all_un_concat = np.concatenate([um.flatten() for um in all_un_maps])
+                global_min = np.min(all_un_concat)
+                global_max = np.max(all_un_concat)
+                global_mean = np.mean(all_un_concat)
+                global_std = np.std(all_un_concat)
+                
+                # 使用百分位数确定可视化范围 (保留1%和99%的极值)
+                p1 = np.percentile(all_un_concat, 1)   # 1%分位
+                p99 = np.percentile(all_un_concat, 99)  # 99%分位
+                
+                # 方案选择:
+                # 方案A: 使用百分位数范围 (推荐,保留极值显示)
+                vis_min = p1
+                vis_max = p99
+                
+                # 方案B: 如果想看到更多红色,可以压缩上限
+                # vis_min = p1
+                # vis_max = global_mean + 1.5 * global_std  # 只保留到均值+1.5σ
+                
+                # 确保有合理的动态范围
+                if vis_max - vis_min < 0.05:
+                    # 范围太小,强制扩展
+                    vis_center = (vis_min + vis_max) / 2
+                    vis_min = max(0.0, vis_center - 0.025)
+                    vis_max = min(1.0, vis_center + 0.025)
+                
+                # 📊 记录统计信息 (只记录第一次)
+                if idx == 0:
+                    logger = get_root_logger()
+                    logger.info(f"[Validation] Uncertainty map stats: "
+                              f"min={global_min:.4f}, max={global_max:.4f}, "
+                              f"mean={global_mean:.4f}, std={global_std:.4f}, "
+                              f"p1={p1:.4f}, p99={p99:.4f} "
+                              f"(vis_range=[{vis_min:.4f}, {vis_max:.4f}])")
+                
+                # 生成可视化
+                import matplotlib
+                matplotlib.use('Agg')
+                import matplotlib.cm as cm
+                
+                for ii, un_map in enumerate(all_un_maps):
+                    # 百分位数归一化到 [0, 1]
                     un_map_norm = np.clip((un_map - vis_min) / (vis_max - vis_min + 1e-8), 0.0, 1.0)
                     
-                    # 转换为热力图
-                    import matplotlib
-                    matplotlib.use('Agg')
-                    import matplotlib.cm as cm
+                    # 🔧 反转映射: U²M当前输出是"确定性"而非"不确定性"
+                    # 大值 → 平滑区域(低不确定性) → 蓝色
+                    # 小值 → 复杂区域(高不确定性) → 红色
+                    un_map_norm_inverted = 1.0 - un_map_norm
                     
-                    # 使用 jet 色图（蓝色=低不确定性，红色=高不确定性）
-                    colored = cm.jet(un_map_norm)[:, :, :3]  # 去掉alpha通道
+                    # 使用 jet 色图（蓝色=低不确定性/平滑区域，红色=高不确定性/边缘纹理）
+                    colored = cm.jet(un_map_norm_inverted)[:, :, :3]  # 去掉alpha通道
                     colored = (colored * 255).astype('uint8')
                     uncertainty_imgs.append(colored)
-                    
-                    # 📊 添加统计信息到日志
-                    if idx == 0 and ii == 0:  # 只记录第一个batch的第一张图
-                        logger = get_root_logger()
-                        logger.info(f"[Validation] Uncertainty map stats: "
-                                  f"min={un_map.min():.4f}, max={un_map.max():.4f}, "
-                                  f"mean={un_map.mean():.4f}, std={un_map.std():.4f} "
-                                  f"(vis_range=[{vis_min:.2f}, {vis_max:.2f}])")
             
             if 'gt' in visuals:
                 # gt_img = tensor2img([visuals['gt']])
