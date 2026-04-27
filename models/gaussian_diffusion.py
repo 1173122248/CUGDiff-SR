@@ -604,6 +604,106 @@ class GaussianDiffusion:
 
         return terms, self.decode_first_stage(x_t), self.decode_first_stage(pred_xstart)
 
+    def training_dynamic_losses(
+        self,
+        model,
+        net_u2m,
+        x_start,
+        y,
+        y_hat,
+        un,
+        t_start,
+        model_kwargs=None,
+        rollout_steps=2,
+        mix_alpha=0.1,
+        ddim_eta=0.0,
+        dynamic_update_un=False,
+        freeze_u2m=True,
+        clip_denoised=True,
+    ):
+        """
+        C-lite training rollout: keep base one-step training intact and add a
+        short differentiable DDIM chain with dynamic U2M override alignment.
+        """
+        if model_kwargs is None:
+            model_kwargs = {}
+        else:
+            model_kwargs = dict(model_kwargs)
+
+        y = self.encode_first_stage(y)
+        y_hat = self.encode_first_stage(y_hat)
+        un = self.encode_first_stage(un)
+        x_start = self.encode_first_stage(x_start)
+
+        # Keep model interface consistent with existing path.
+        model_kwargs['un'] = un
+
+        noise = torch.randn_like(x_start)
+        x_t = self.q_sample(x_start, y, y_hat, un, t_start, noise=noise)
+
+        rollout_steps = max(1, int(rollout_steps))
+        mix_alpha = float(max(0.0, min(1.0, mix_alpha)))
+
+        x_sample = x_t
+        un_current = un
+        step_losses = []
+        step_pred_delta = []
+        pred_xstart_mix_last = None
+
+        for j in range(rollout_steps):
+            t_step = torch.clamp(t_start - j, min=0)
+            step_out = self.ddim_training_step(
+                model=model,
+                net_u2m=net_u2m,
+                x=x_sample,
+                y=y,
+                y_hat=y_hat,
+                un=un_current,
+                t=t_step,
+                model_kwargs=model_kwargs,
+                clip_denoised=clip_denoised,
+                ddim_eta=ddim_eta,
+                mix_alpha=mix_alpha,
+                dynamic_update_un=dynamic_update_un,
+                freeze_u2m=freeze_u2m,
+            )
+
+            pred_xstart_mix = step_out["pred_xstart_mix"]
+            pred_xstart_base = step_out["pred_xstart_base"]
+            pred_xstart_mix_last = pred_xstart_mix
+
+            # Latent-space L1 is the most stable first-stage supervision here.
+            loss_step = F.l1_loss(pred_xstart_mix, x_start)
+            step_losses.append(loss_step)
+
+            pred_delta = torch.mean(torch.abs(pred_xstart_mix - pred_xstart_base))
+            step_pred_delta.append(pred_delta)
+
+            x_sample = step_out["x_prev"]
+            if dynamic_update_un:
+                un_current = step_out["un_next"]
+
+        if len(step_losses) == 0:
+            loss_dyn_total = torch.zeros((), device=x_start.device, dtype=x_start.dtype)
+            loss_final = loss_dyn_total
+            pred_delta_mean = loss_dyn_total
+        else:
+            step_losses_stacked = torch.stack(step_losses, dim=0)
+            # Average to keep loss scale controlled for stable training.
+            loss_dyn_total = torch.nan_to_num(step_losses_stacked.mean(), nan=0.0, posinf=1e3, neginf=0.0)
+            loss_final = torch.nan_to_num(F.l1_loss(pred_xstart_mix_last, x_start), nan=0.0, posinf=1e3, neginf=0.0)
+            pred_delta_mean = torch.nan_to_num(torch.stack(step_pred_delta, dim=0).mean(), nan=0.0, posinf=1e3, neginf=0.0)
+
+        return {
+            "loss_dyn_total": loss_dyn_total,
+            "loss_final": loss_final,
+            "step_losses": step_losses,
+            "pred_xstart_mix_last": pred_xstart_mix_last,
+            "pred_delta_mean": pred_delta_mean,
+            "x_t": x_t,
+            "x_rollout_last": x_sample,
+        }
+
     def _scale_input(self, inputs, un, t):
         if self.normalize_input:
             un_safe = un.clamp(min=1e-3, max=1.0)
@@ -670,6 +770,171 @@ class GaussianDiffusion:
         return {
             "sample": sample,
             "pred_xstart": pred_xstart,
+            "mean": mean_pred,
+        }
+
+    def ddim_training_step(
+        self,
+        model,
+        net_u2m,
+        x,
+        y,
+        y_hat,
+        un,
+        t,
+        model_kwargs=None,
+        clip_denoised=True,
+        denoised_fn=None,
+        ddim_eta=0.0,
+        pred_xstart_override=None,
+        mix_alpha=0.1,
+        dynamic_update_un=False,
+        freeze_u2m=True,
+    ):
+        """
+        Differentiable one-step DDIM update for training.
+        Reuses the dynamic U2M override logic from inference path.
+        """
+        if model_kwargs is None:
+            model_kwargs = {}
+        else:
+            model_kwargs = dict(model_kwargs)
+
+        # Remove transient keys and keep rollout-control args from leaking into model(...).
+        model_kwargs.pop('pred_xstart_override', None)
+        model_kwargs.pop('eps_perturbed', None)
+        blocked_model_keys = {
+            'y0',
+            'sf',
+            'u2m_noise_scale',
+            'use_time_bias',
+            'net_u2m',
+            'u2m_apply_interval',
+            'u2m_start_ratio',
+            'u2m_mix_alpha',
+            'u2m_mix_with_global_v',
+            'dynamic_update_un',
+        }
+        model_net_kwargs = {k: v for k, v in model_kwargs.items() if k not in blocked_model_keys}
+
+        # Base prediction from current backbone.
+        base_out = self.p_mean_variance(
+            model=model,
+            x_t=x,
+            y=y,
+            y_hat=y_hat,
+            un=un,
+            t=t,
+            clip_denoised=clip_denoised,
+            denoised_fn=denoised_fn,
+            model_kwargs=model_net_kwargs,
+        )
+        pred_xstart_base = base_out["pred_xstart"]
+
+        if pred_xstart_override is not None:
+            pred_xstart_dyn = pred_xstart_override
+            eps_hat = None
+            eps_perturbed = None
+            un_next = un
+        else:
+            pred_xstart_dyn = pred_xstart_base
+            eps_hat = None
+            eps_perturbed = None
+            un_next = un
+
+            if net_u2m is not None:
+                sf = int(model_kwargs.get('sf', self.sf))
+                y0 = model_kwargs.get('y0', None)
+                if y0 is None:
+                    # Fallback: use current degraded branch; shape-safe but less ideal.
+                    y0 = self.decode_first_stage(y)
+
+                x_decoded = F.pixel_shuffle(x, sf)
+                y0_up = F.interpolate(
+                    y0,
+                    size=x_decoded.shape[2:],
+                    mode='bilinear',
+                    align_corners=False,
+                )
+                u2m_input = torch.cat([y0_up, x_decoded], dim=1)
+
+                if freeze_u2m:
+                    with torch.no_grad():
+                        sigma_map_rgb, global_v = net_u2m(u2m_input)
+                    sigma_map_rgb = sigma_map_rgb.detach()
+                    global_v = global_v.detach()
+                else:
+                    sigma_map_rgb, global_v = net_u2m(u2m_input)
+
+                t_ratio = t.float().mean() / float(max(self.num_timesteps, 1))
+                if model_kwargs.get('use_time_bias', False):
+                    time_bias = 0.5 * (1.0 + math.cos(math.pi * t_ratio.item()))
+                    global_v_adjusted = global_v * (0.5 + 0.5 * time_bias)
+                else:
+                    global_v_adjusted = global_v
+
+                eps_hat = self._predict_eps_from_xstart(
+                    x_t=x,
+                    y=y,
+                    un=un,
+                    t=t,
+                    pred_xstart=pred_xstart_base,
+                )
+
+                noise_random = torch.randn_like(eps_hat)
+                bsz = eps_hat.shape[0]
+                eps_norm = torch.norm(eps_hat.flatten(1), dim=1, keepdim=True).view(bsz, 1, 1, 1)
+                eps_normalized = eps_hat / (eps_norm + 1e-8)
+                z_direction = 0.8 * eps_normalized + 0.2 * noise_random
+
+                sigma_latent = F.pixel_unshuffle(sigma_map_rgb, sf)
+                sigma_latent_expanded = sigma_latent.repeat(1, 3, 1, 1)
+
+                gamma = model_kwargs.get('u2m_noise_scale', 0.3)
+                eps_perturb = global_v_adjusted * gamma * sigma_latent_expanded * z_direction
+                eps_perturbed = eps_hat + eps_perturb
+
+                pred_xstart_dyn = self._predict_xstart_from_eps(
+                    x_t=x,
+                    y=y,
+                    un=un,
+                    t=t,
+                    eps=eps_perturbed,
+                )
+                if clip_denoised:
+                    pred_xstart_dyn = pred_xstart_dyn.clamp(-1, 1)
+
+                if dynamic_update_un:
+                    sigma_3ch = sigma_map_rgb.repeat(1, 3, 1, 1)
+                    un_next = F.pixel_unshuffle(sigma_3ch, sf)
+
+        mix_alpha = float(max(0.0, min(1.0, mix_alpha)))
+        pred_xstart_mix = (1.0 - mix_alpha) * pred_xstart_base + mix_alpha * pred_xstart_dyn
+        if clip_denoised:
+            pred_xstart_mix = pred_xstart_mix.clamp(-1, 1)
+
+        etas = _extract_into_tensor(self.etas, t, x.shape)
+        etas_prev = _extract_into_tensor(self.etas_prev, t, x.shape)
+        alpha = _extract_into_tensor(self.alpha, t, x.shape)
+        sigma = ddim_eta * self.kappa * torch.sqrt(etas_prev / etas) * torch.sqrt(alpha)
+
+        m_t = torch.sqrt(etas_prev / etas)
+        k_t = (1 - etas_prev - (1 - etas) * m_t)
+        y_t = (etas_prev - torch.sqrt(etas * etas_prev)) * y
+
+        noise = torch.randn_like(x)
+        mean_pred = pred_xstart_mix * k_t + x * m_t + y_t
+        nonzero_mask = (t != 0).float().view(-1, *([1] * (len(x.shape) - 1)))
+        x_prev = mean_pred + nonzero_mask * sigma * noise
+
+        return {
+            "x_prev": x_prev,
+            "pred_xstart_base": pred_xstart_base,
+            "pred_xstart_dyn": pred_xstart_dyn,
+            "pred_xstart_mix": pred_xstart_mix,
+            "un_next": un_next,
+            "eps_hat": eps_hat,
+            "eps_perturbed": eps_perturbed,
             "mean": mean_pred,
         }
 
@@ -762,120 +1027,86 @@ class GaussianDiffusion:
         for i in indices:
             t = torch.tensor([i] * y.shape[0], device=device)
             with torch.no_grad():
-                # === 动态U2M: ε空间自适应注入 (基于DDIM文档方案) ===
+                # 先清掉上一步遗留的动态变量，避免跨步串用
+                model_kwargs.pop('pred_xstart_override', None)
+                model_kwargs.pop('eps_perturbed', None)
+
                 apply_interval = model_kwargs.get('u2m_apply_interval', 1) if 'net_u2m' in model_kwargs else 1
-                should_apply_u2m = (i % apply_interval == 0)  # 按间隔应用
-                
-                # 用于存储扰动后的eps (如果需要)
-                eps_perturbed = None
-                
-                if 'net_u2m' in model_kwargs and model_kwargs['net_u2m'] is not None and i < self.num_timesteps - 1 and should_apply_u2m:
+                should_apply_u2m = (i % apply_interval == 0)
+
+                # 默认：普通 DDIM fallback
+                sample_kwargs = {}
+                if model_kwargs is not None and 'lq' in model_kwargs:
+                    sample_kwargs['lq'] = model_kwargs['lq']
+
+                # 当前步是否启用 dynamic U2M
+                if (
+                    'net_u2m' in model_kwargs
+                    and model_kwargs['net_u2m'] is not None
+                    and i < self.num_timesteps - 1
+                    and should_apply_u2m
+                ):
                     net_u2m = model_kwargs['net_u2m']
                     y0 = model_kwargs['y0']
                     sf = model_kwargs['sf']
-                    
-                    # 解码当前x_sample到像素空间: PixelShuffle(潜在特征) -> RGB图像
-                    # x_sample: (B, 3*sf^2, H, W) -> x_decoded: (B, 3, H*sf, W*sf)
+
                     x_decoded = torch.nn.functional.pixel_shuffle(x_sample, sf)
-                    
-                    # 上采样LR到HR尺寸
                     y0_up = torch.nn.functional.interpolate(
                         y0, size=x_decoded.shape[2:],
                         mode='bilinear', align_corners=False
                     )
-                    
-                    # === U2M预测 (改进版: 输出sigma_map和global_v) ===
+
                     u2m_input = torch.cat([y0_up, x_decoded], dim=1)
-                    sigma_map_rgb, global_v = net_u2m(u2m_input)  
-                    # sigma_map_rgb: (B, 1, H*sf, W*sf) - 空间自适应
-                    # global_v: (B, 1, 1, 1) - 全局图像级强度 (0~1)
-                    
-                    # === global_v作为主控制,替代固定时间衰减 ===
-                    # 核心改进: 不再使用gamma_t固定时间衰减
-                    # 而是让U²M根据图像内容动态决定噪声强度
-                    # 
-                    # 优势:
-                    # - 复杂/欠去噪区域: global_v大 → 强噪声注入 → 重新去噪
-                    # - 已良好区域: global_v小 → 弱噪声 → 保护质量
-                    # - 内容自适应: 不同图像/时间步有不同需求
-                    
-                    # 可选: 添加温和的时间衰减偏置(避免早期过于激进)
-                    t_ratio = i / self.num_timesteps  # [1.0 -> 0.0]
+                    sigma_map_rgb, global_v = net_u2m(u2m_input)
+
+                    t_ratio = i / self.num_timesteps
                     if model_kwargs.get('use_time_bias', False):
-                        # 时间偏置: 早期略微保守,后期完全由global_v决定
                         import math
                         time_bias = 0.5 * (1.0 + math.cos(math.pi * t_ratio))
-                        # 后期(t小)time_bias→0, global_v主导
-                        # 早期(t大)time_bias→1, 略微抑制
                         global_v_adjusted = global_v * (0.5 + 0.5 * time_bias)
                     else:
-                        # 完全由U²M决定(推荐)
                         global_v_adjusted = global_v
-                    
-                    # 外部缩放因子(超参数,用于全局控制强度范围)
-                    gamma_scale = model_kwargs.get('u2m_noise_scale', 0.3)  # 提高默认值到0.3
-                    gamma = gamma_scale  # 不再乘以固定时间衰减
-                    
-                    # === ε空间注入策略 ===
-                    # 先用当前x_sample通过DDIM获取eps预测
-                    # 注意: 这里需要调用模型来获取eps_hat
-                    # 为了获取eps,我们需要临时调用一次p_mean_variance
-                    
-                    # 准备过滤后的kwargs (只保留UNet需要的参数)
+
+                    gamma_scale = model_kwargs.get('u2m_noise_scale', 0.3)
+                    gamma = gamma_scale
+
                     temp_filtered_kwargs = {}
-                    if model_kwargs is not None:
-                        unet_keys = ['lq']
-                        for key in unet_keys:
-                            if key in model_kwargs:
-                                temp_filtered_kwargs[key] = model_kwargs[key]
-                    
-                    with torch.no_grad():
-                        temp_out = self.p_mean_variance(
-                            model=model,
-                            x_t=x_sample,
-                            y=y,
-                            y_hat=y_hat,
-                            un=model_kwargs.get('un', un),
-                            t=t,
-                            clip_denoised=clip_denoised,
-                            denoised_fn=denoised_fn,
-                            model_kwargs=temp_filtered_kwargs,
-                        )
-                        pred_xstart_temp = temp_out["pred_xstart"]
-                        # 从pred_xstart反推eps
-                        eps_hat = self._predict_eps_from_xstart(
-                            x_t=x_sample,
-                            y=y,
-                            un=model_kwargs.get('un', un),
-                            t=t,
-                            pred_xstart=pred_xstart_temp
-                        )
-                    
-                    # === 构造噪声方向 z ===
-                    # 策略: 80%沿eps方向 + 20%随机 (文档建议)
+                    if model_kwargs is not None and 'lq' in model_kwargs:
+                        temp_filtered_kwargs['lq'] = model_kwargs['lq']
+
+                    temp_out = self.p_mean_variance(
+                        model=model,
+                        x_t=x_sample,
+                        y=y,
+                        y_hat=y_hat,
+                        un=model_kwargs.get('un', un),
+                        t=t,
+                        clip_denoised=clip_denoised,
+                        denoised_fn=denoised_fn,
+                        model_kwargs=temp_filtered_kwargs,
+                    )
+                    pred_xstart_temp = temp_out["pred_xstart"]
+
+                    eps_hat = self._predict_eps_from_xstart(
+                        x_t=x_sample,
+                        y=y,
+                        un=model_kwargs.get('un', un),
+                        t=t,
+                        pred_xstart=pred_xstart_temp
+                    )
+
                     noise_random = torch.randn_like(eps_hat)
-                    # 正确的归一化: 对batch中每个样本分别计算norm
                     B_local = eps_hat.shape[0]
                     eps_norm = torch.norm(eps_hat.flatten(1), dim=1, keepdim=True).view(B_local, 1, 1, 1)
                     eps_normalized = eps_hat / (eps_norm + 1e-8)
                     z_direction = 0.8 * eps_normalized + 0.2 * noise_random
-                    
-                    # === 将σ_map从RGB空间转换到latent空间 ===
-                    # sigma_map_rgb: (B,1,H*sf,W*sf) -> sigma_latent: (B,sf^2,H,W)
+
                     sigma_latent = torch.nn.functional.pixel_unshuffle(sigma_map_rgb, sf)
-                    # 扩展到3通道: (B,sf^2,H,W) -> (B,3*sf^2,H,W)
                     sigma_latent_expanded = sigma_latent.repeat(1, 3, 1, 1)
-                    
-                    # === ε空间扰动 (改进版: global_v调制) ===
-                    # 核心公式: eps_perturb = global_v * sigma_map * z * gamma
-                    # - global_v: 图像级自适应强度 (U²M学习得到)
-                    # - sigma_map: 空间级局部调制
-                    # - z: 噪声方向 (80%模型方向+20%随机)
-                    # - gamma: 外部超参数缩放
+
                     eps_perturb = global_v_adjusted * gamma * sigma_latent_expanded * z_direction
                     eps_perturbed = eps_hat + eps_perturb
-                    
-                    # === 用扰动后的eps重新计算x_0预测 ===
+
                     pred_xstart_new = self._predict_xstart_from_eps(
                         x_t=x_sample,
                         y=y,
@@ -883,47 +1114,34 @@ class GaussianDiffusion:
                         t=t,
                         eps=eps_perturbed
                     )
-                    
-                    # Clip x_0预测
+
                     if clip_denoised:
                         pred_xstart_new = pred_xstart_new.clamp(-1, 1)
-                    
-                    # 更新不确定性图（用于下一步去噪的条件）
-                    sigma_3ch = sigma_map_rgb.repeat(1, 3, 1, 1)  # (B,3,H*sf,W*sf)
-                    un_updated = torch.nn.functional.pixel_unshuffle(sigma_3ch, sf)  # (B,3*sf^2,H,W)
-                    model_kwargs['un'] = un_updated
-                    
-                    # 将新的pred_xstart存储,后续ddim_sample会使用
-                    model_kwargs['pred_xstart_override'] = pred_xstart_new
-                    model_kwargs['eps_perturbed'] = eps_perturbed
-                
-                    # 传给ddim_sample的参数：
-                    # - lq: 给UNet正常条件输入
-                    # - pred_xstart_override: 给DDIM当前步直接覆盖x0预测
-                    sample_kwargs = {}
-                    if model_kwargs is not None:
-                        if 'lq' in model_kwargs:
-                            sample_kwargs['lq'] = model_kwargs['lq']
-                        if 'pred_xstart_override' in model_kwargs:
-                            sample_kwargs['pred_xstart_override'] = model_kwargs['pred_xstart_override']
-                        if 'eps_perturbed' in model_kwargs:
-                            sample_kwargs['eps_perturbed'] = model_kwargs['eps_perturbed']
 
-                    out = self.ddim_sample(
-                        model=model,
-                        x=x_sample,
-                        y=y,
-                        y_hat=y_hat,
-                        un=model_kwargs.get('un', un),
-                        t=t,
-                        clip_denoised=clip_denoised,
-                        denoised_fn=denoised_fn,
-                        model_kwargs=sample_kwargs,
-                        ddim_eta=ddim_eta,
-                    )
+                    sigma_3ch = sigma_map_rgb.repeat(1, 3, 1, 1)
+                    un_updated = torch.nn.functional.pixel_unshuffle(sigma_3ch, sf)
+                    model_kwargs['un'] = un_updated
+
+                    sample_kwargs['pred_xstart_override'] = pred_xstart_new
+                    sample_kwargs['eps_perturbed'] = eps_perturbed
+
+                out = self.ddim_sample(
+                    model=model,
+                    x=x_sample,
+                    y=y,
+                    y_hat=y_hat,
+                    un=model_kwargs.get('un', un),
+                    t=t,
+                    clip_denoised=clip_denoised,
+                    denoised_fn=denoised_fn,
+                    model_kwargs=sample_kwargs,
+                    ddim_eta=ddim_eta,
+                )
+
                 if one_step:
                     out["sample"] = out["pred_xstart"]
                     yield out
                     break
+
                 yield out
                 x_sample = out["sample"]
